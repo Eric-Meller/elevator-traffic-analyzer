@@ -1282,6 +1282,7 @@ export default function ElevatorCalculator() {
         arrivalRate: config.rate,
         doorHeightFt: ov.doorHeightFt || 8,
         trafficPattern: config.pattern,
+        deterministicRttSec: zone.roundTripTimeSec,
       };
 
       // Yield to UI between zones
