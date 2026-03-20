@@ -1,15 +1,30 @@
 /**
  * Monte Carlo Elevator Traffic Simulation Engine
  *
- * Runs N independent 5-minute peak-period simulations using a discrete
- * tick-based model (0.5 s increments).  Each trial generates Poisson
- * passenger arrivals, dispatches them to elevator cars via a destination-
- * dispatch heuristic, and records per-passenger wait / travel / journey
- * times.  Aggregate statistics across all trials feed histogram and
- * confidence-interval outputs for the UI.
+ * Methodology based on "Elevator Traffic-Flow Prediction Based on Monte
+ * Carlo Method" (Wang Sheng et al., Elevator World).
  *
- * Kinematic constants and S-curve travel-time functions are copied from
- * the deterministic elevatorEngine.ts so results stay consistent.
+ * Core principles:
+ *   1. Poisson arrivals — passengers arrive as a Poisson process with
+ *      rate λ = population × arrivalRate / 300 s.
+ *   2. Origin/Destination via cumulative probability (CDF) — the "improved
+ *      roulette model" from the article.  Per-floor population weights
+ *      build a CDF; inverse-transform sampling picks floors.
+ *   3. Traffic-pattern split — three fractions (x, y, z) control the
+ *      mix of upward, downward, and interfloor trips per the article's
+ *      OD-matrix methodology.
+ *   4. Raw simulated AWT — each passenger's wait is boardTime − arrivalTime.
+ *      The trial mean AWT is the average across all boarded passengers.
+ *      NO formula-based override (interval × 0.55); the simulation is
+ *      the measurement instrument.
+ *   5. Multiple trials (N = 200-2000) — aggregate statistics (median,
+ *      P10/P90) characterise the stochastic distribution.
+ *
+ * The deterministic engine's AWT = (RTT/L) × 0.55 is a theoretical
+ * steady-state approximation.  MC AWTs will typically be somewhat lower
+ * because the simulation captures actual dispatch efficiency, lobby
+ * batching, and finite-duration effects.  Both are valid; they answer
+ * different questions (theoretical capacity vs. simulated experience).
  */
 
 // ═══════════════════════════════════════════════════════════════════
@@ -29,7 +44,7 @@ export interface MonteCarloParams {
   arrivalRate: number;          // fraction of population arriving in 5 min
   doorHeightFt: number;         // 7 or 8
   trafficPattern: 'uppeak' | 'mixed';
-  deterministicRttSec?: number; // optional: RTT from deterministic engine for AWT calibration
+  deterministicRttSec?: number; // deterministic RTT (for interval / formula-AWT reference)
   elevatorsOutOfService?: number;
   seed?: number;                // PRNG seed (default 42)
 }
@@ -107,16 +122,49 @@ function mulberry32(seed: number): () => number {
 
 /** Exponential variate: −ln(U) / λ */
 function expVariate(rand: () => number, lambda: number): number {
-  // Guard: avoid log(0)
   let u = rand();
   while (u === 0) u = rand();
   return -Math.log(u) / lambda;
 }
 
-/** Weighted random index: pick floor proportional to population. */
-function weightedChoice(rand: () => number, cdf: Float64Array): number {
+// ═══════════════════════════════════════════════════════════════════
+// CDF-BASED FLOOR SELECTION  (Article: "improved roulette model")
+// ═══════════════════════════════════════════════════════════════════
+//
+// Per the article's "improved" method: build a cumulative density
+// from per-floor populations, then use inverse-transform sampling.
+// This is more accurate than the "traditional" max(rand × density)
+// roulette because it correctly preserves probability mass.
+
+/**
+ * Build cumulative distribution function from population weights.
+ * Returns Float64Array where CDF[i] = P(floor ≤ i).
+ */
+function buildCdf(populations: number[]): Float64Array {
+  const total = populations.reduce((a, b) => a + b, 0);
+  const cdf = new Float64Array(populations.length);
+  if (total <= 0) {
+    // Uniform fallback
+    for (let i = 0; i < populations.length; i++) {
+      cdf[i] = (i + 1) / populations.length;
+    }
+  } else {
+    let cum = 0;
+    for (let i = 0; i < populations.length; i++) {
+      cum += populations[i] / total;
+      cdf[i] = cum;
+    }
+    cdf[populations.length - 1] = 1.0; // avoid FP issues
+  }
+  return cdf;
+}
+
+/**
+ * Inverse-transform sampling: pick floor index from CDF.
+ * Article: "If lj_{i-1} < w < lj_i, the ith floor is the original floor."
+ */
+function sampleFromCdf(rand: () => number, cdf: Float64Array): number {
   const u = rand();
-  // Binary search in CDF
   let lo = 0;
   let hi = cdf.length - 1;
   while (lo < hi) {
@@ -125,6 +173,70 @@ function weightedChoice(rand: () => number, cdf: Float64Array): number {
     else hi = mid;
   }
   return lo;
+}
+
+/**
+ * Build conditional CDF for destination given origin floor.
+ * Excludes the origin floor, redistributes probability among remaining
+ * floors.  This implements the article's OD matrix row normalisation:
+ *   p_ij = od(i,j) / sum_i  where sum_i excludes i=j.
+ */
+function buildConditionalCdf(
+  populations: number[],
+  excludeIndex: number,
+): Float64Array {
+  let total = 0;
+  for (let i = 0; i < populations.length; i++) {
+    if (i !== excludeIndex) total += populations[i];
+  }
+  const cdf = new Float64Array(populations.length);
+  if (total <= 0) {
+    // Uniform excluding origin
+    const n = populations.length - 1;
+    let cum = 0;
+    for (let i = 0; i < populations.length; i++) {
+      if (i !== excludeIndex) {
+        cum += 1 / n;
+      }
+      cdf[i] = cum;
+    }
+  } else {
+    let cum = 0;
+    for (let i = 0; i < populations.length; i++) {
+      if (i !== excludeIndex) {
+        cum += populations[i] / total;
+      }
+      cdf[i] = cum;
+    }
+  }
+  cdf[populations.length - 1] = 1.0;
+  return cdf;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// TRAFFIC PATTERN SPLIT  (Article: x/y/z percentages)
+// ═══════════════════════════════════════════════════════════════════
+//
+// x = fraction upward (lobby → floor)
+// y = fraction downward (floor → lobby)
+// z = fraction interfloor (floor → floor, both non-lobby)
+// x + y + z = 1
+
+interface TrafficSplit {
+  x: number; // up (lobby → floor)
+  y: number; // down (floor → lobby)
+  z: number; // interfloor (floor → floor)
+}
+
+function getTrafficSplit(pattern: 'uppeak' | 'mixed'): TrafficSplit {
+  switch (pattern) {
+    case 'uppeak':
+      return { x: 0.90, y: 0.05, z: 0.05 };
+    case 'mixed':
+      return { x: 0.45, y: 0.45, z: 0.10 };
+    default:
+      return { x: 0.90, y: 0.05, z: 0.05 };
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -182,17 +294,6 @@ function sCurveTravelTime(Vmax: number, d: number, aMax: number, j: number): num
 // PRE-COMPUTED TRAVEL TIME TABLE
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * Build a table of travel times between every pair of zone floors
- * (including the virtual "lobby" floor at index 0).
- *
- * floorElevations[0] = 0 (lobby / zone entry),
- * floorElevations[1..N] = cumulative heights of zone demand floors.
- *
- * Returns a flat Float64Array of size (N+1)² where
- *   travelTime(a, b) = table[a * stride + b]
- * Each value includes leveling time.
- */
 function buildTravelTimeTable(
   floorElevationsFt: Float64Array,
   speedFpm: number,
@@ -208,7 +309,6 @@ function buildTravelTimeTable(
       table[a * N + b] = t;
       table[b * N + a] = t;
     }
-    // table[a * N + a] = 0 (already zero)
   }
   return table;
 }
@@ -242,33 +342,27 @@ const enum CarState {
 /** Lobby dispatch batch delay: after a passenger is assigned to an idle car
  *  at lobby, the car waits this many seconds before departing, allowing
  *  additional arrivals to board the same car. */
-const LOBBY_DISPATCH_DELAY_SEC = 5.0; // seconds
+const LOBBY_DISPATCH_DELAY_SEC = 5.0;
 
 interface Car {
   id: number;
   state: CarState;
-  currentFloor: number;     // floor index the car is at (or heading toward)
-  targetFloor: number;      // immediate next floor target
-  passengers: Passenger[];  // on board
-  tripPlan: number[];       // ordered list of floor stops remaining
-  stateTimer: number;       // countdown for current state action
+  currentFloor: number;
+  targetFloor: number;
+  passengers: Passenger[];
+  tripPlan: number[];
+  stateTimer: number;
   maxPassengers: number;
-  busyTicks: number;        // ticks where car was not idle (for utilization)
-  lobbyDwellTimer: number;  // countdown for lobby dwell period
-  lastLobbyDepartureTime: number;  // sim time when car last left the lobby with passengers
-  roundTripTimes: number[];        // completed round trip durations (lobby→floors→lobby)
+  busyTicks: number;
+  lobbyDwellTimer: number;
+  lastLobbyDepartureTime: number;
+  roundTripTimes: number[];
 }
 
 // ═══════════════════════════════════════════════════════════════════
 // DISPATCH ALGORITHM — destination dispatch heuristic
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * Insert a floor stop into a car's trip plan at the position that
- * minimises additional travel time.  Returns the incremental cost
- * (extra travel seconds) of the insertion, or Infinity if the car
- * is at capacity.
- */
 function insertionCost(
   car: Car,
   floor: number,
@@ -276,55 +370,26 @@ function insertionCost(
   numFloors: number,
 ): number {
   if (car.passengers.length >= car.maxPassengers) return Infinity;
-
   const plan = car.tripPlan;
-
-  // If floor is already in the plan, cost = 0
   if (plan.indexOf(floor) !== -1) return 0;
-
-  // Empty plan — cost is travel from current position to floor
   if (plan.length === 0) {
     return travelTable[car.currentFloor * numFloors + floor];
   }
 
-  // Try every insertion position and pick the cheapest
   let bestCost = Infinity;
   for (let i = 0; i <= plan.length; i++) {
     const prev = i === 0 ? car.currentFloor : plan[i - 1];
     const next = i < plan.length ? plan[i] : -1;
-
-    // Cost of original edge (prev → next)
     let originalEdge = 0;
-    if (next >= 0) {
-      originalEdge = travelTable[prev * numFloors + next];
-    }
-
-    // Cost of new edges (prev → floor → next)
+    if (next >= 0) originalEdge = travelTable[prev * numFloors + next];
     let newEdge = travelTable[prev * numFloors + floor];
-    if (next >= 0) {
-      newEdge += travelTable[floor * numFloors + next];
-    }
-
-    // Door cycle cost for the new stop
-    // (only charged if this floor wasn't already a stop)
-    const doorPenalty = 0; // door time is already modeled in the tick sim
-
-    const cost = newEdge - originalEdge + doorPenalty;
+    if (next >= 0) newEdge += travelTable[floor * numFloors + next];
+    const cost = newEdge - originalEdge;
     if (cost < bestCost) bestCost = cost;
   }
-
   return bestCost;
 }
 
-/**
- * Assign a passenger to the best car.  Inserts the passenger's
- * destination into the chosen car's trip plan.
- *
- * Also inserts the passenger's *origin* floor into the trip plan
- * if the car is not already at that floor (for picking up).
- *
- * Returns the car index, or -1 if no car is available (passenger queued).
- */
 function dispatchPassenger(
   passenger: Passenger,
   cars: Car[],
@@ -338,7 +403,6 @@ function dispatchPassenger(
     const car = cars[c];
     if (car.passengers.length >= car.maxPassengers) continue;
 
-    // Cost = cost to pick up at origin + cost to deliver to destination
     let pickupCost = 0;
     if (car.currentFloor !== passenger.originFloor &&
         car.tripPlan.indexOf(passenger.originFloor) === -1) {
@@ -347,12 +411,10 @@ function dispatchPassenger(
     const deliverCost = insertionCost(car, passenger.destFloor, travelTable, numFloors);
     const totalCost = pickupCost + deliverCost;
 
-    // Prefer idle cars (lower tie-breaking)
     const idleBonus = car.state === CarState.Idle ? -0.01 : 0;
-    // Prefer less loaded cars
     const loadPenalty = car.passengers.length * 0.5;
-
     const score = totalCost + idleBonus + loadPenalty;
+
     if (score < bestCost) {
       bestCost = score;
       bestCar = c;
@@ -361,12 +423,10 @@ function dispatchPassenger(
 
   if (bestCar >= 0) {
     const car = cars[bestCar];
-    // Insert origin into trip plan if needed
     if (car.currentFloor !== passenger.originFloor &&
         car.tripPlan.indexOf(passenger.originFloor) === -1) {
       insertFloorIntoTripPlan(car, passenger.originFloor, travelTable, numFloors);
     }
-    // Insert destination into trip plan if needed
     if (car.tripPlan.indexOf(passenger.destFloor) === -1) {
       insertFloorIntoTripPlan(car, passenger.destFloor, travelTable, numFloors);
     }
@@ -375,7 +435,6 @@ function dispatchPassenger(
   return bestCar;
 }
 
-/** Insert a floor into a car's trip plan at the cheapest position. */
 function insertFloorIntoTripPlan(
   car: Car,
   floor: number,
@@ -412,22 +471,19 @@ function insertFloorIntoTripPlan(
 // ═══════════════════════════════════════════════════════════════════
 
 interface TrialResult {
-  meanAwt: number;
-  meanInterval: number;
-  meanRtt: number;
-  simulatedRtt: number;          // raw per-car RTT from simulation (before calibration)
+  meanAwt: number;             // raw simulated mean AWT (boardTime - arrivalTime)
+  meanInterval: number;        // mean interval between lobby departures
+  simulatedRtt: number;        // mean per-car round trip time
   hcPercent: number;
   totalServed: number;
   totalArrived: number;
-  passengerWaits: number[];      // per-passenger AWT for this trial
-  /** Timeline snapshots (every 10 s) */
+  passengerWaits: number[];
   timeline: {
     timeSec: number;
     waitingPassengers: number;
     activeElevators: number;
     passengersServed: number;
   }[];
-  /** Per-car busy ticks */
   carBusyTicks: number[];
 }
 
@@ -435,39 +491,57 @@ function runSingleTrial(
   params: MonteCarloParams,
   rand: () => number,
   travelTable: Float64Array,
-  numFloors: number,               // total floor indices (lobby + demand floors)
-  floorCdf: Float64Array,          // CDF for weighted destination choice
-  expressTimeSec: number,          // one-way express time (lobby → zone bottom)
+  numFloors: number,
+  floorCdf: Float64Array,            // CDF for demand floors (article: cumulative density)
+  conditionalCdfs: Float64Array[],   // per-origin conditional CDFs for destination
   doorCycle: number,
   effectiveCapacity: number,
   activeElevators: number,
+  trafficSplit: TrafficSplit,
 ): TrialResult {
-  const { simulationDuration, floorPopulations, trafficPattern } = params;
+  const { simulationDuration, floorPopulations } = params;
   const totalPop = floorPopulations.reduce((a, b) => a + b, 0);
   const totalTicks = Math.ceil(simulationDuration / TICK_DT);
+  const numDemandFloors = floorPopulations.length;
 
   // Poisson arrival rate: λ = totalPop × arrivalRate / duration
   const lambda = (totalPop * params.arrivalRate) / simulationDuration;
 
   // ── Generate all arrivals up front ──
+  // Article methodology: for each passenger, determine arrival time
+  // (Poisson), then origin floor (CDF), then destination floor
+  // (conditional CDF from OD matrix row).
   const arrivals: Passenger[] = [];
   let t = expVariate(rand, lambda);
   while (t < simulationDuration) {
-    // Origin: lobby (index 0) for uppeak, or random floor for mixed (50% each direction)
-    let origin = 0;
+    let origin: number; // 0 = lobby, 1..N = demand floors
     let dest: number;
 
-    if (trafficPattern === 'mixed' && rand() < 0.5) {
-      // Outgoing: random floor → lobby
-      origin = weightedChoice(rand, floorCdf) + 1; // +1 because index 0 = lobby
+    const roll = rand();
+
+    if (roll < trafficSplit.x) {
+      // Upward: lobby → random floor (proportional to population)
+      origin = 0;
+      dest = sampleFromCdf(rand, floorCdf) + 1;
+    } else if (roll < trafficSplit.x + trafficSplit.y) {
+      // Downward: random floor → lobby
+      origin = sampleFromCdf(rand, floorCdf) + 1;
       dest = 0;
     } else {
-      // Incoming: lobby → random floor
-      origin = 0;
-      dest = weightedChoice(rand, floorCdf) + 1;
+      // Interfloor: floor → floor (neither lobby)
+      // Origin from CDF, destination from conditional CDF excluding origin
+      const originIdx = sampleFromCdf(rand, floorCdf);
+      origin = originIdx + 1;
+      // Destination: another demand floor, weighted by population
+      let destIdx = sampleFromCdf(rand, conditionalCdfs[originIdx]);
+      // If the CDF sampling lands on the excluded floor, nudge
+      if (destIdx === originIdx) {
+        destIdx = (destIdx + 1) % numDemandFloors;
+      }
+      dest = destIdx + 1;
     }
 
-    // Avoid origin == dest
+    // Safety: avoid origin == dest
     if (origin === dest) {
       dest = origin === 0 ? 1 : 0;
     }
@@ -488,7 +562,7 @@ function runSingleTrial(
     cars.push({
       id: i,
       state: CarState.Idle,
-      currentFloor: 0,       // start at lobby
+      currentFloor: 0,
       targetFloor: 0,
       passengers: [],
       tripPlan: [],
@@ -502,21 +576,18 @@ function runSingleTrial(
   }
 
   // ── Queues ──
-  // waitingByFloor[floor] = passengers waiting at that floor for pickup
   const waitingByFloor: Passenger[][] = new Array(numFloors);
   for (let f = 0; f < numFloors; f++) waitingByFloor[f] = [];
-  // Global queue for passengers that couldn't be assigned yet
   const unassigned: Passenger[] = [];
 
-  // ── Timeline snapshots ──
+  // ── Timeline ──
   const timelineBucketSec = 10;
   const numBuckets = Math.ceil(simulationDuration / timelineBucketSec);
   const timeline: TrialResult['timeline'] = [];
 
   let arrivalIdx = 0;
-  let servedCount = 0;   // passengers who alighted (completed journey)
-  let boardedCount = 0;  // passengers who boarded (for HC%)
-  // Track lobby departure times for interval measurement
+  let servedCount = 0;
+  let boardedCount = 0;
   const lobbyDepartures: number[] = [];
 
   // ── Tick loop ──
@@ -526,7 +597,6 @@ function runSingleTrial(
     // --- 1. Inject new arrivals ---
     while (arrivalIdx < arrivals.length && arrivals[arrivalIdx].arrivalTime <= simTime) {
       const pax = arrivals[arrivalIdx++];
-      // Try to dispatch immediately
       const carIdx = dispatchPassenger(pax, cars, travelTable, numFloors);
       if (carIdx >= 0) {
         waitingByFloor[pax.originFloor].push(pax);
@@ -536,7 +606,7 @@ function runSingleTrial(
       }
     }
 
-    // --- 2. Retry unassigned passengers ---
+    // --- 2. Retry unassigned ---
     if (unassigned.length > 0) {
       for (let i = unassigned.length - 1; i >= 0; i--) {
         const pax = unassigned[i];
@@ -557,11 +627,10 @@ function runSingleTrial(
 
       switch (car.state) {
         case CarState.Idle: {
-          // Check if there are passengers waiting at the current floor
           const waitingHere = waitingByFloor[car.currentFloor];
           if (waitingHere.length > 0 && car.passengers.length < car.maxPassengers) {
             if (car.currentFloor === 0) {
-              // At lobby: enter batch-wait mode. Only one car at a time.
+              // Lobby: batch-wait mode (one car at a time)
               const anotherDwelling = cars.some((other, oi) =>
                 oi !== c && other.state === CarState.LobbyDwell
               );
@@ -570,15 +639,13 @@ function runSingleTrial(
                 car.lobbyDwellTimer = LOBBY_DISPATCH_DELAY_SEC;
                 car.busyTicks++;
               }
-              // If another car is already dwelling, this car stays idle
             } else {
-              // At a non-lobby floor: open doors immediately
+              // Non-lobby floor: open doors immediately
               car.state = CarState.DoorOpening;
               car.stateTimer = doorCycle / 2;
               car.busyTicks++;
             }
           } else if (car.tripPlan.length > 0) {
-            // Start moving to next stop
             car.targetFloor = car.tripPlan[0];
             if (car.targetFloor === car.currentFloor) {
               car.tripPlan.shift();
@@ -597,26 +664,17 @@ function runSingleTrial(
         }
 
         case CarState.LobbyDwell: {
-          // Batch-wait at lobby: passengers stay in the queue (NOT boarded)
-          // until the dwell expires, then doors open to board everyone at once.
-          // This means passenger wait time = arrivalTime → boardTime,
-          // where boardTime is when doors open AFTER the dwell.
           car.lobbyDwellTimer -= TICK_DT;
           car.busyTicks++;
-
-          // Count how many passengers are assigned to this car in the queue
           const lobbyQueue = waitingByFloor[0];
           const assignedCount = lobbyQueue.length + car.passengers.length;
 
-          // Depart when dwell expires OR car would be full
           if (car.lobbyDwellTimer <= TICK_DT / 2 || assignedCount >= car.maxPassengers) {
             car.lobbyDwellTimer = 0;
-            // Open doors to board waiting passengers
             if (lobbyQueue.length > 0) {
               car.state = CarState.DoorOpening;
               car.stateTimer = doorCycle / 2;
             } else if (car.tripPlan.length > 0) {
-              // All passengers were already assigned elsewhere, start moving
               car.targetFloor = car.tripPlan[0];
               car.state = CarState.TravelingToFloor;
               let tt = travelTable[car.currentFloor * numFloors + car.targetFloor];
@@ -632,22 +690,17 @@ function runSingleTrial(
         case CarState.TravelingToFloor: {
           car.stateTimer -= TICK_DT;
           if (car.stateTimer <= TICK_DT / 2) {
-            // Arrived at target floor
             car.currentFloor = car.targetFloor;
-            // Remove this floor from trip plan
             const idx = car.tripPlan.indexOf(car.currentFloor);
             if (idx >= 0) car.tripPlan.splice(idx, 1);
 
-            // Per-car RTT tracking: if car returned to lobby after a trip
+            // Per-car RTT tracking
             if (car.currentFloor === 0 && car.lastLobbyDepartureTime >= 0) {
               const rtt = simTime - car.lastLobbyDepartureTime;
-              if (rtt > 0) {
-                car.roundTripTimes.push(rtt);
-              }
-              car.lastLobbyDepartureTime = -1; // reset for next trip
+              if (rtt > 0) car.roundTripTimes.push(rtt);
+              car.lastLobbyDepartureTime = -1;
             }
 
-            // Open doors
             car.state = CarState.DoorOpening;
             car.stateTimer = doorCycle / 2;
           }
@@ -657,10 +710,9 @@ function runSingleTrial(
         case CarState.DoorOpening: {
           car.stateTimer -= TICK_DT;
           if (car.stateTimer <= TICK_DT / 2) {
-            // Doors open — alight then board
             car.state = CarState.Boarding;
 
-            // Alight passengers whose destination is this floor
+            // Alight passengers
             let alightCount = 0;
             for (let p = car.passengers.length - 1; p >= 0; p--) {
               if (car.passengers[p].destFloor === car.currentFloor) {
@@ -671,7 +723,7 @@ function runSingleTrial(
               }
             }
 
-            // Board waiting passengers at this floor (up to capacity)
+            // Board waiting passengers
             const waiting = waitingByFloor[car.currentFloor];
             let boardCount = 0;
             for (let w = waiting.length - 1; w >= 0; w--) {
@@ -682,20 +734,17 @@ function runSingleTrial(
               waiting.splice(w, 1);
               boardCount++;
               boardedCount++;
-              // Ensure destination is in trip plan
               if (car.tripPlan.indexOf(pax.destFloor) === -1) {
                 insertFloorIntoTripPlan(car, pax.destFloor, travelTable, numFloors);
               }
             }
 
-            // Track lobby departures for interval measurement and RTT
+            // Track lobby departures
             if (car.currentFloor === 0 && car.passengers.length > 0) {
               lobbyDepartures.push(simTime);
-              // Mark departure time for per-car RTT tracking
               car.lastLobbyDepartureTime = simTime;
             }
 
-            // Transfer time = (alightCount + boardCount) × PASSENGER_TRANSFER
             car.stateTimer = (alightCount + boardCount) * PASSENGER_TRANSFER;
             if (car.stateTimer < TICK_DT) car.stateTimer = TICK_DT;
           }
@@ -705,7 +754,6 @@ function runSingleTrial(
         case CarState.Boarding: {
           car.stateTimer -= TICK_DT;
           if (car.stateTimer <= TICK_DT / 2) {
-            // Close doors
             car.state = CarState.DoorClosing;
             car.stateTimer = doorCycle / 2;
           }
@@ -715,7 +763,6 @@ function runSingleTrial(
         case CarState.DoorClosing: {
           car.stateTimer -= TICK_DT;
           if (car.stateTimer <= TICK_DT / 2) {
-            // Doors closed — go idle (will pick up next stop on next tick)
             car.state = CarState.Idle;
             car.stateTimer = 0;
           }
@@ -741,9 +788,8 @@ function runSingleTrial(
   }
 
   // ── Collect passenger metrics ──
-  // Only include passengers who actually boarded for AWT.
-  // Unserved passengers indicate system overload but should not
-  // inflate the wait-time metric (they represent a different failure mode).
+  // RAW SIMULATED AWT: boardTime − arrivalTime for each boarded passenger.
+  // This is the article's prescribed measurement — no formula override.
   const allWaits: number[] = [];
   let sumAwt = 0;
   let countServed = 0;
@@ -755,36 +801,14 @@ function runSingleTrial(
       sumAwt += wait;
       countServed++;
     }
-    // Unserved passengers are excluded from AWT to avoid inflating
-    // the metric with sim-boundary artifacts.
   }
 
-  // Raw simulated wait (boardTime - arrivalTime)
-  const rawSimulatedAwt = countServed > 0 ? sumAwt / countServed : 0;
-
-  // For reporting, use the industry-standard formula: AWT = interval × 0.55
-  // This matches the deterministic engine and produces comparable results.
-  // The raw simulated wait is often lower because with well-sized elevator
-  // groups, there's usually a car available at lobby. The formula-based
-  // AWT accounts for the theoretical steady-state queuing behaviour.
-  // We compute it after measuring the interval below.
+  const rawMeanAwt = countServed > 0 ? sumAwt / countServed : 0;
 
   // HC% = passengers boarded / total population × 100
-  // Uses boardedCount (passengers picked up) rather than alighted count,
-  // since passengers boarded late may still be in transit at sim end.
   const hcPercent = totalPop > 0 ? (boardedCount / totalPop) * 100 : 0;
 
-  // ── Interval & AWT computation ──
-  // Strategy: use the deterministic RTT when provided (most reliable for
-  // AWT calibration), otherwise fall back to per-car RTT tracking from
-  // the simulation, then to lobby departure gaps.
-  //
-  // The deterministic RTT assumes full-capacity loading and probabilistic
-  // stop patterns, which is the industry-standard basis for AWT.
-  // The simulated per-car RTT is typically lower because cars in a sparse
-  // arrival pattern make shorter trips with fewer stops.
-
-  // Collect per-car RTTs for diagnostic purposes regardless
+  // Per-car RTT
   let allRtts: number[] = [];
   for (const car of cars) {
     allRtts = allRtts.concat(car.roundTripTimes);
@@ -796,48 +820,18 @@ function runSingleTrial(
     simulatedMeanRtt = sumRtt / allRtts.length;
   }
 
-  let meanRtt: number;
-  let meanInterval: number;
-
-  // Use deterministic RTT as the baseline, then apply stochastic noise
-  // from the simulation to produce realistic trial-to-trial variation.
-  if (params.deterministicRttSec && params.deterministicRttSec > 0) {
-    const detRtt = params.deterministicRttSec;
-
-    if (simulatedMeanRtt > 0) {
-      // Calibrated hybrid: scale the simulated RTT so it centers on
-      // the deterministic RTT but preserves trial-to-trial variation.
-      // calibrationFactor = detRTT / globalMeanSimRTT (computed in main loop)
-      // For per-trial: use this trial's simulated RTT × calibration factor.
-      // Since calibration factor isn't available inside a single trial,
-      // we apply it in the main loop. For now, use deterministic RTT
-      // and let the main loop apply per-trial correction.
-      meanRtt = detRtt;
-    } else {
-      meanRtt = detRtt;
-    }
-    meanInterval = meanRtt / activeElevators;
-  } else if (simulatedMeanRtt > 0) {
-    // No deterministic RTT — use simulated per-car RTT
-    meanRtt = simulatedMeanRtt;
-    meanInterval = meanRtt / activeElevators;
-  } else if (lobbyDepartures.length >= 2) {
-    // Fallback: use lobby departure gaps
+  // Interval from lobby departures
+  let meanInterval = 0;
+  if (lobbyDepartures.length >= 2) {
     lobbyDepartures.sort((a, b) => a - b);
     let sumGaps = 0;
     for (let i = 1; i < lobbyDepartures.length; i++) {
       sumGaps += lobbyDepartures[i] - lobbyDepartures[i - 1];
     }
     meanInterval = sumGaps / (lobbyDepartures.length - 1);
-    meanRtt = meanInterval * activeElevators;
-  } else {
-    // Fallback: estimate from raw simulated wait
-    meanInterval = rawSimulatedAwt > 0 ? rawSimulatedAwt / 0.55 : simulationDuration;
-    meanRtt = meanInterval * activeElevators;
+  } else if (simulatedMeanRtt > 0) {
+    meanInterval = simulatedMeanRtt / activeElevators;
   }
-
-  // Formula-based AWT (matches deterministic engine): interval × 0.55
-  const meanAwt = meanInterval * 0.55;
 
   // Fill remaining timeline slots
   while (timeline.length < numBuckets) {
@@ -854,9 +848,8 @@ function runSingleTrial(
   }
 
   return {
-    meanAwt,
+    meanAwt: rawMeanAwt,       // pure simulated AWT per the article
     meanInterval,
-    meanRtt,
     simulatedRtt: simulatedMeanRtt,
     hcPercent,
     totalServed: servedCount,
@@ -898,8 +891,8 @@ export function runMonteCarloSimulation(params: MonteCarloParams): MonteCarloRes
     floorHeights,
     floorPopulations,
     expressDistanceFt,
-    arrivalRate,
     doorHeightFt,
+    trafficPattern,
     elevatorsOutOfService = 0,
     seed = 42,
   } = params;
@@ -907,49 +900,36 @@ export function runMonteCarloSimulation(params: MonteCarloParams): MonteCarloRes
   const activeElevators = Math.max(1, numElevators - elevatorsOutOfService);
   const effectiveCapacity = Math.floor(capacityPersons * CAR_LOADING_FACTOR);
 
-  // ── Build floor elevation array ──
-  // Index 0 = lobby at actual elevation 0 (ground level).
-  // Indices 1..N = zone demand floors at their true elevations,
-  // so the travel-time table includes the express run as part of
-  // a single continuous S-curve (no split accel–decel penalty).
+  // ── Floor elevations ──
   const numDemandFloors = floorPopulations.length;
-  const numFloors = numDemandFloors + 1; // lobby + demand floors
+  const numFloors = numDemandFloors + 1;
 
   const floorElevations = new Float64Array(numFloors);
-  floorElevations[0] = 0; // lobby at ground level
-  let cumHeight = expressDistanceFt; // start at express distance (zone bottom)
+  floorElevations[0] = 0;
+  let cumHeight = expressDistanceFt;
   for (let i = 0; i < numDemandFloors; i++) {
     cumHeight += (i < floorHeights.length ? floorHeights[i] : (floorHeights[floorHeights.length - 1] || 13));
     floorElevations[i + 1] = cumHeight;
   }
 
-  // Express time is now baked into the travel table — no separate penalty needed.
-  const expressTimeSec = 0; // kept for API compat but unused in tick loop
-
   // ── Pre-compute travel time table ──
   const travelTable = buildTravelTimeTable(floorElevations, speedFpm);
 
-  // ── Destination CDF (for weighted floor choice) ──
-  const totalPop = floorPopulations.reduce((a, b) => a + b, 0);
-  const floorCdf = new Float64Array(numDemandFloors);
-  if (totalPop > 0) {
-    let cum = 0;
-    for (let i = 0; i < numDemandFloors; i++) {
-      cum += floorPopulations[i] / totalPop;
-      floorCdf[i] = cum;
-    }
-    // Ensure last entry is exactly 1.0 (avoid floating-point issues)
-    floorCdf[numDemandFloors - 1] = 1.0;
-  } else {
-    // Uniform distribution fallback
-    for (let i = 0; i < numDemandFloors; i++) {
-      floorCdf[i] = (i + 1) / numDemandFloors;
-    }
+  // ── Build CDFs (article: cumulative density functions) ──
+  const floorCdf = buildCdf(floorPopulations);
+
+  // ── Build per-origin conditional CDFs for interfloor traffic ──
+  // Article: "for every passenger, determine original floor i, then
+  //  construct a roulette with n-1 intervals ... proportional to OD row i"
+  const conditionalCdfs: Float64Array[] = [];
+  for (let i = 0; i < numDemandFloors; i++) {
+    conditionalCdfs.push(buildConditionalCdf(floorPopulations, i));
   }
 
-  const doorCycle = doorCycleTime(doorHeightFt);
+  // ── Traffic split ──
+  const trafficSplit = getTrafficSplit(trafficPattern);
 
-  // ── PRNG ──
+  const doorCycle = doorCycleTime(doorHeightFt);
   const rand = mulberry32(seed);
 
   // ── Run trials ──
@@ -957,19 +937,11 @@ export function runMonteCarloSimulation(params: MonteCarloParams): MonteCarloRes
   const trialHcPercents = new Float64Array(numTrials);
   const trialIntervals = new Float64Array(numTrials);
 
-  // Accumulate per-car utilization across trials
   const carBusyAccum = new Float64Array(activeElevators);
   let totalPassengers = 0;
-  let representativeIdx = 0;
   let representativeTimeline: TrialResult['timeline'] = [];
   let representativeCarBusy: number[] = [];
-
-  // Track the trial closest to the median AWT for representative timeline
-  // We'll pick the middle trial after sorting by AWT
   const trialResults: TrialResult[] = [];
-
-  // Also collect per-trial simulated RTT for calibration
-  const trialSimRtts = new Float64Array(numTrials);
 
   for (let trial = 0; trial < numTrials; trial++) {
     const result = runSingleTrial(
@@ -978,69 +950,29 @@ export function runMonteCarloSimulation(params: MonteCarloParams): MonteCarloRes
       travelTable,
       numFloors,
       floorCdf,
-      expressTimeSec,
+      conditionalCdfs,
       doorCycle,
       effectiveCapacity,
       activeElevators,
+      trafficSplit,
     );
 
     trialAwts[trial] = result.meanAwt;
     trialHcPercents[trial] = result.hcPercent;
     trialIntervals[trial] = result.meanInterval;
-    trialSimRtts[trial] = result.simulatedRtt;
     totalPassengers += result.totalArrived;
 
     for (let c = 0; c < activeElevators; c++) {
       carBusyAccum[c] += result.carBusyTicks[c];
     }
 
-    // Store first trial's timeline as representative candidate
-    // (we'll select the actual median trial later)
     if (trial === 0) {
       representativeTimeline = result.timeline;
       representativeCarBusy = result.carBusyTicks;
     }
 
-    // Keep a lightweight reference for representative selection
-    // For large trial counts, only store timeline for first few trials
     if (trial < 10) {
       trialResults.push(result);
-    }
-  }
-
-  // ── Calibrated AWT: apply deterministic RTT calibration with sim variation ──
-  // When the deterministic RTT is provided, we want each trial's AWT to:
-  //   - Center around the deterministic AWT (interval×0.55)
-  //   - Vary trial-to-trial based on simulated RTT differences
-  //
-  // Method: compute calibration factor = detRTT / mean(simRTTs),
-  // then each trial's calibrated RTT = simRTT[i] × calibrationFactor.
-  // This preserves relative variation while centering on the deterministic value.
-  const detRtt = params.deterministicRttSec;
-  if (detRtt && detRtt > 0) {
-    // Compute mean of simulated RTTs (only from trials that have valid data)
-    let sumSimRtt = 0;
-    let countSimRtt = 0;
-    for (let i = 0; i < numTrials; i++) {
-      if (trialSimRtts[i] > 0) {
-        sumSimRtt += trialSimRtts[i];
-        countSimRtt++;
-      }
-    }
-
-    if (countSimRtt > 0) {
-      const meanSimRtt = sumSimRtt / countSimRtt;
-      const calibrationFactor = detRtt / meanSimRtt;
-
-      for (let i = 0; i < numTrials; i++) {
-        if (trialSimRtts[i] > 0) {
-          const calibratedRtt = trialSimRtts[i] * calibrationFactor;
-          const calibratedInterval = calibratedRtt / activeElevators;
-          trialAwts[i] = calibratedInterval * 0.55;
-          trialIntervals[i] = calibratedInterval;
-        }
-        // Trials with no simulated RTT keep their original formula-based AWT
-      }
     }
   }
 
@@ -1049,20 +981,19 @@ export function runMonteCarloSimulation(params: MonteCarloParams): MonteCarloRes
   const sortedHc = new Float64Array(trialHcPercents).sort();
   const sortedIntervals = new Float64Array(trialIntervals).sort();
 
-  // Find the trial closest to median AWT for representative timeline
+  // Find representative trial (closest to median AWT)
   const medAwt = median(sortedAwts);
   let closestDist = Infinity;
   for (let i = 0; i < Math.min(trialResults.length, 10); i++) {
-    const dist = Math.abs(trialAwts[i] - medAwt); // use calibrated AWT
+    const dist = Math.abs(trialResults[i].meanAwt - medAwt);
     if (dist < closestDist) {
       closestDist = dist;
-      representativeIdx = i;
       representativeTimeline = trialResults[i].timeline;
       representativeCarBusy = trialResults[i].carBusyTicks;
     }
   }
 
-  // ── Car utilization (% of time busy) ──
+  // ── Car utilization ──
   const totalTicks = Math.ceil(simulationDuration / TICK_DT);
   const carUtilization: number[] = [];
   for (let c = 0; c < activeElevators; c++) {
@@ -1070,10 +1001,13 @@ export function runMonteCarloSimulation(params: MonteCarloParams): MonteCarloRes
     carUtilization.push(Math.round((avgBusyTicks / totalTicks) * 1000) / 10);
   }
 
-  // ── Collect trial-level RTT values ──
+  // ── RTT from simulated per-car tracking ──
   const trialRtts = new Float64Array(numTrials);
   for (let i = 0; i < numTrials; i++) {
-    trialRtts[i] = trialIntervals[i] * activeElevators;
+    // RTT = interval × numElevators (from sim data)
+    trialRtts[i] = trialIntervals[i] > 0
+      ? trialIntervals[i] * activeElevators
+      : 0;
   }
   const sortedRtts = new Float64Array(trialRtts).sort();
 
@@ -1101,14 +1035,14 @@ export function runMonteCarloSimulation(params: MonteCarloParams): MonteCarloRes
     totalPassengersSimulated: totalPassengers,
   };
 
-  // ── Stress test (if running with out-of-service elevators) ──
+  // ── Stress test ──
   if (elevatorsOutOfService > 0) {
     result.stressTest = {
       elevatorsRemoved: elevatorsOutOfService,
       medianAwtSec: result.medianAwtSec,
       p90AwtSec: result.p90AwtSec,
       meanHcPercent: result.meanHcPercent,
-      degradationPercent: 0, // caller computes vs. baseline
+      degradationPercent: 0,
     };
   }
 
@@ -1119,23 +1053,14 @@ export function runMonteCarloSimulation(params: MonteCarloParams): MonteCarloRes
 // STRESS TEST HELPER
 // ═══════════════════════════════════════════════════════════════════
 
-/**
- * Run a stress test by removing 1 elevator from service.
- * Runs the full simulation, then computes degradation vs. a baseline
- * run with all elevators.
- */
 export function runStressTest(params: MonteCarloParams): MonteCarloResult {
   const seed = params.seed ?? 42;
-  // Run baseline (all elevators) — use same seed for reproducibility
   const baselineParams = { ...params, elevatorsOutOfService: 0, seed };
   const baseline = runMonteCarloSimulation(baselineParams);
 
-  // Run degraded (one elevator removed) — use same seed so arrival
-  // sequences match and the only variable is the missing car
   const stressParams = { ...params, elevatorsOutOfService: 1, seed };
   const stressed = runMonteCarloSimulation(stressParams);
 
-  // Compute degradation
   const degradation = baseline.medianAwtSec > 0
     ? ((stressed.medianAwtSec - baseline.medianAwtSec) / baseline.medianAwtSec) * 100
     : 0;
