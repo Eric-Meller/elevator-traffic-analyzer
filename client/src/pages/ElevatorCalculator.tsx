@@ -37,8 +37,177 @@ import { analyzeElevators, recalculateZone, STANDARD_CAPACITIES, STANDARD_SPEEDS
 import { parseExcelFile } from "@/lib/excelParser";
 import { exportAnalysisPDF } from "@/lib/pdfExport";
 import { exportAreaChartExcel } from "@/lib/excelExport";
+import { runMonteCarloSimulation, runStressTest } from "@/lib/monteCarloEngine";
+import type { MonteCarloParams, MonteCarloResult } from "@/lib/monteCarloEngine";
 import type { BuildingType, FloorInput, AnalysisResult, ZoneOutput, ZoneOverride } from "@shared/schema";
 import { buildingTypes, buildingTypeLabels } from "@shared/schema";
+
+// ═══════════════════════════════════════════════
+// BUILDING ARRIVAL RATE LOOKUP
+// ═══════════════════════════════════════════════
+
+const BUILDING_ARRIVAL_RATES: Record<string, { rate: number; pattern: 'uppeak' | 'mixed' }> = {
+  office_standard: { rate: 0.12, pattern: 'uppeak' },
+  office_prestige: { rate: 0.13, pattern: 'uppeak' },
+  hotel: { rate: 0.11, pattern: 'mixed' },
+  residential: { rate: 0.065, pattern: 'mixed' },
+  hospital: { rate: 0.10, pattern: 'uppeak' },
+  ballroom_event: { rate: 0.25, pattern: 'uppeak' },
+};
+
+// ═══════════════════════════════════════════════
+// SVG CHART COMPONENTS (inline, dark theme)
+// ═══════════════════════════════════════════════
+
+function AwtHistogram({ trialAwts, p10, median, p90 }: { trialAwts: number[]; p10: number; median: number; p90: number }) {
+  const NUM_BINS = 20;
+  if (trialAwts.length === 0) return null;
+
+  const min = Math.min(...trialAwts);
+  const max = Math.max(...trialAwts);
+  const range = max - min || 1;
+  const binWidth = range / NUM_BINS;
+
+  const bins = new Array(NUM_BINS).fill(0);
+  for (const v of trialAwts) {
+    const idx = Math.min(Math.floor((v - min) / binWidth), NUM_BINS - 1);
+    bins[idx]++;
+  }
+  const maxBin = Math.max(...bins, 1);
+
+  const W = 400, H = 160;
+  const padL = 36, padR = 8, padT = 12, padB = 28;
+  const chartW = W - padL - padR;
+  const chartH = H - padT - padB;
+  const barW = chartW / NUM_BINS;
+
+  const toX = (val: number) => padL + ((val - min) / range) * chartW;
+
+  const markers = [
+    { val: p10, label: 'P10', color: '#FFC553' },
+    { val: median, label: 'Med', color: '#20808D' },
+    { val: p90, label: 'P90', color: '#FFC553' },
+  ];
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" preserveAspectRatio="xMidYMid meet">
+      {/* Y axis labels */}
+      <text x={padL - 4} y={padT + 4} textAnchor="end" className="fill-muted-foreground" style={{ fontSize: 9 }}>{maxBin}</text>
+      <text x={padL - 4} y={padT + chartH} textAnchor="end" className="fill-muted-foreground" style={{ fontSize: 9 }}>0</text>
+      {/* Bars */}
+      {bins.map((count, i) => {
+        const barH = (count / maxBin) * chartH;
+        return (
+          <rect
+            key={i}
+            x={padL + i * barW + 1}
+            y={padT + chartH - barH}
+            width={Math.max(barW - 2, 1)}
+            height={barH}
+            fill="#20808D"
+            opacity={0.7}
+            rx={1}
+          />
+        );
+      })}
+      {/* Marker lines */}
+      {markers.map((m) => {
+        const x = toX(m.val);
+        if (x < padL || x > padL + chartW) return null;
+        return (
+          <g key={m.label}>
+            <line x1={x} y1={padT} x2={x} y2={padT + chartH} stroke={m.color} strokeWidth={1.5} strokeDasharray={m.label === 'Med' ? '' : '3,3'} />
+            <text x={x} y={padT - 2} textAnchor="middle" fill={m.color} style={{ fontSize: 8, fontWeight: 600 }}>{m.label}</text>
+          </g>
+        );
+      })}
+      {/* X axis labels */}
+      <text x={padL} y={H - 4} textAnchor="middle" className="fill-muted-foreground" style={{ fontSize: 8 }}>{min.toFixed(0)}s</text>
+      <text x={padL + chartW} y={H - 4} textAnchor="middle" className="fill-muted-foreground" style={{ fontSize: 8 }}>{max.toFixed(0)}s</text>
+      <text x={padL + chartW / 2} y={H - 4} textAnchor="middle" className="fill-muted-foreground" style={{ fontSize: 8 }}>AWT (sec)</text>
+      {/* Baseline */}
+      <line x1={padL} y1={padT + chartH} x2={padL + chartW} y2={padT + chartH} stroke="currentColor" strokeOpacity={0.15} strokeWidth={1} />
+    </svg>
+  );
+}
+
+function TrafficTimeline({ data }: { data: { timeSec: number; waitingPassengers: number; passengersServed: number }[] }) {
+  if (data.length === 0) return null;
+
+  const W = 400, H = 140;
+  const padL = 36, padR = 8, padT = 12, padB = 28;
+  const chartW = W - padL - padR;
+  const chartH = H - padT - padB;
+
+  const maxTime = Math.max(...data.map(d => d.timeSec), 300);
+  const maxWait = Math.max(...data.map(d => d.waitingPassengers), 1);
+  const maxServed = Math.max(...data.map(d => d.passengersServed), 1);
+  const maxY = Math.max(maxWait, maxServed);
+
+  const toX = (t: number) => padL + (t / maxTime) * chartW;
+  const toY = (v: number) => padT + chartH - (v / maxY) * chartH;
+
+  const waitPath = data.map((d, i) => `${i === 0 ? 'M' : 'L'}${toX(d.timeSec).toFixed(1)},${toY(d.waitingPassengers).toFixed(1)}`).join('');
+  const servePath = data.map((d, i) => `${i === 0 ? 'M' : 'L'}${toX(d.timeSec).toFixed(1)},${toY(d.passengersServed).toFixed(1)}`).join('');
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" preserveAspectRatio="xMidYMid meet">
+      {/* Grid lines */}
+      {[0.25, 0.5, 0.75].map(f => (
+        <line key={f} x1={padL} y1={padT + chartH * (1 - f)} x2={padL + chartW} y2={padT + chartH * (1 - f)} stroke="currentColor" strokeOpacity={0.08} />
+      ))}
+      {/* Y labels */}
+      <text x={padL - 4} y={padT + 4} textAnchor="end" className="fill-muted-foreground" style={{ fontSize: 8 }}>{maxY}</text>
+      <text x={padL - 4} y={padT + chartH} textAnchor="end" className="fill-muted-foreground" style={{ fontSize: 8 }}>0</text>
+      {/* Lines */}
+      <path d={waitPath} fill="none" stroke="#FFC553" strokeWidth={1.5} opacity={0.85} />
+      <path d={servePath} fill="none" stroke="#20808D" strokeWidth={1.5} opacity={0.85} />
+      {/* X labels */}
+      <text x={padL} y={H - 4} textAnchor="start" className="fill-muted-foreground" style={{ fontSize: 8 }}>0s</text>
+      <text x={padL + chartW / 2} y={H - 4} textAnchor="middle" className="fill-muted-foreground" style={{ fontSize: 8 }}>150s</text>
+      <text x={padL + chartW} y={H - 4} textAnchor="end" className="fill-muted-foreground" style={{ fontSize: 8 }}>300s</text>
+      {/* Legend */}
+      <rect x={padL + chartW - 100} y={padT} width={8} height={3} fill="#FFC553" rx={1} />
+      <text x={padL + chartW - 88} y={padT + 3} className="fill-muted-foreground" style={{ fontSize: 7 }}>Waiting</text>
+      <rect x={padL + chartW - 50} y={padT} width={8} height={3} fill="#20808D" rx={1} />
+      <text x={padL + chartW - 38} y={padT + 3} className="fill-muted-foreground" style={{ fontSize: 7 }}>Served</text>
+      {/* Baseline */}
+      <line x1={padL} y1={padT + chartH} x2={padL + chartW} y2={padT + chartH} stroke="currentColor" strokeOpacity={0.15} strokeWidth={1} />
+    </svg>
+  );
+}
+
+function CarUtilizationBars({ utilization }: { utilization: number[] }) {
+  if (utilization.length === 0) return null;
+
+  const barH = 18;
+  const gap = 4;
+  const padL = 44, padR = 40;
+  const W = 400;
+  const H = utilization.length * (barH + gap) + gap;
+  const chartW = W - padL - padR;
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" preserveAspectRatio="xMidYMid meet">
+      {utilization.map((pct, i) => {
+        const y = gap + i * (barH + gap);
+        const w = Math.max((pct / 100) * chartW, 1);
+        return (
+          <g key={i}>
+            {/* Background */}
+            <rect x={padL} y={y} width={chartW} height={barH} fill="currentColor" opacity={0.06} rx={3} />
+            {/* Fill */}
+            <rect x={padL} y={y} width={w} height={barH} fill="#20808D" opacity={0.75} rx={3} />
+            {/* Label */}
+            <text x={padL - 4} y={y + barH / 2 + 1} textAnchor="end" dominantBaseline="middle" className="fill-muted-foreground" style={{ fontSize: 9 }}>Car {i + 1}</text>
+            {/* Pct */}
+            <text x={padL + chartW + 4} y={y + barH / 2 + 1} textAnchor="start" dominantBaseline="middle" className="fill-foreground" style={{ fontSize: 9, fontWeight: 600, fontFamily: 'monospace' }}>{pct.toFixed(1)}%</text>
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
 
 // ═══════════════════════════════════════════════
 // FLOOR INPUT ROW
@@ -167,10 +336,12 @@ interface ZoneCardProps {
   onOverrideChange: (zoneIndex: number, overrides: ZoneOverride) => void;
   onReset: (zoneIndex: number) => void;
   hasOverrides: boolean;
+  mcResult?: MonteCarloResult;
+  mcRunning?: boolean;
 }
 
-function ZoneCard({ zone, overrides, onOverrideChange, onReset, hasOverrides }: ZoneCardProps) {
-  const [expanded, setExpanded] = useState<false | 'details' | 'engineering'>(false);
+function ZoneCard({ zone, overrides, onOverrideChange, onReset, hasOverrides, mcResult, mcRunning }: ZoneCardProps) {
+  const [expanded, setExpanded] = useState<false | 'details' | 'engineering' | 'simulation'>(false);
   const [tuning, setTuning] = useState(false);
 
   const handleOverride = (field: keyof ZoneOverride, value: number | undefined) => {
@@ -250,6 +421,7 @@ function ZoneCard({ zone, overrides, onOverrideChange, onReset, hasOverrides }: 
           label="Avg Wait"
           value={zone.avgWaitTimeSec.toFixed(1)}
           unit="sec"
+          mcRange={mcResult ? `MC: ${mcResult.p10AwtSec.toFixed(1)} – ${mcResult.p90AwtSec.toFixed(1)}s` : undefined}
         />
       </div>
 
@@ -296,6 +468,25 @@ function ZoneCard({ zone, overrides, onOverrideChange, onReset, hasOverrides }: 
           <span>Engineering</span>
           {expanded === 'engineering' ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
         </button>
+        {(mcResult || mcRunning) && (
+          <button
+            className={`flex-1 px-5 py-2.5 flex items-center justify-between text-xs transition-colors ${
+              expanded === 'simulation'
+                ? "text-primary bg-primary/5"
+                : "text-muted-foreground hover:text-foreground hover:bg-muted/30"
+            }`}
+            onClick={() => setExpanded(expanded === 'simulation' ? false : 'simulation')}
+            data-testid={`button-simulation-zone-${zone.zoneIndex}`}
+          >
+            <span className="flex items-center gap-1.5">
+              Simulation
+              {mcRunning && !mcResult && (
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-primary animate-pulse" />
+              )}
+            </span>
+            {expanded === 'simulation' ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+          </button>
+        )}
       </div>
 
       {/* Tuning Controls */}
@@ -535,6 +726,86 @@ function ZoneCard({ zone, overrides, onOverrideChange, onReset, hasOverrides }: 
           </div>
         </>
       )}
+
+      {/* Expandable Simulation Panel */}
+      {expanded === 'simulation' && (
+        <>
+          <Separator className="bg-border/30" />
+          {mcRunning && !mcResult ? (
+            <div className="px-5 py-8 flex items-center justify-center gap-2 text-xs text-muted-foreground">
+              <span className="inline-block h-2 w-2 rounded-full bg-primary animate-pulse" />
+              Simulating…
+            </div>
+          ) : mcResult ? (
+            <div className="px-5 py-4 space-y-5">
+              {/* Summary Statistics */}
+              <div>
+                <div className="text-[11px] uppercase tracking-wider text-muted-foreground mb-3 font-medium">Summary Statistics</div>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-6 gap-y-2">
+                  <DetailRow label="Median AWT" value={`${mcResult.medianAwtSec.toFixed(1)} sec`} />
+                  <DetailRow label="P10 – P90 AWT" value={`${mcResult.p10AwtSec.toFixed(1)} – ${mcResult.p90AwtSec.toFixed(1)} sec`} />
+                  <DetailRow label="Mean HC%" value={`${mcResult.meanHcPercent.toFixed(1)}%`} />
+                  <DetailRow label="P10 HC%" value={`${mcResult.p10HcPercent.toFixed(1)}%`} />
+                  <DetailRow label="Median Interval" value={`${mcResult.medianIntervalSec.toFixed(1)} sec`} />
+                  <DetailRow label="P90 Interval" value={`${mcResult.p90IntervalSec.toFixed(1)} sec`} />
+                  <DetailRow label="Median RTT" value={`${mcResult.medianRttSec.toFixed(1)} sec`} />
+                  <DetailRow label="Total Passengers" value={mcResult.totalPassengersSimulated.toLocaleString()} />
+                  <DetailRow label="Confidence" value={`${(mcResult.confidenceLevel * 100).toFixed(0)}% across ${mcResult.numTrials} trials`} />
+                </div>
+              </div>
+
+              {/* AWT Distribution */}
+              <div>
+                <div className="text-[11px] uppercase tracking-wider text-muted-foreground mb-2 font-medium">AWT Distribution</div>
+                <AwtHistogram
+                  trialAwts={mcResult.trialAwts}
+                  p10={mcResult.p10AwtSec}
+                  median={mcResult.medianAwtSec}
+                  p90={mcResult.p90AwtSec}
+                />
+              </div>
+
+              {/* Traffic Flow Timeline */}
+              {mcResult.timelineData.length > 0 && (
+                <div>
+                  <div className="text-[11px] uppercase tracking-wider text-muted-foreground mb-2 font-medium">Traffic Flow (Representative Trial)</div>
+                  <TrafficTimeline data={mcResult.timelineData} />
+                </div>
+              )}
+
+              {/* Car Utilization */}
+              {mcResult.carUtilization.length > 0 && (
+                <div>
+                  <div className="text-[11px] uppercase tracking-wider text-muted-foreground mb-2 font-medium">Car Utilization</div>
+                  <CarUtilizationBars utilization={mcResult.carUtilization} />
+                </div>
+              )}
+
+              {/* Stress Test */}
+              {mcResult.stressTest && (
+                <div>
+                  <div className="text-[11px] uppercase tracking-wider text-muted-foreground mb-3 font-medium">Stress Test (1 Elevator Removed)</div>
+                  <div className="space-y-2">
+                    <DetailRow label="Degraded AWT" value={`${mcResult.stressTest.medianAwtSec.toFixed(1)} sec (P90: ${mcResult.stressTest.p90AwtSec.toFixed(1)})`} />
+                    <DetailRow label="Degraded HC%" value={`${mcResult.stressTest.meanHcPercent.toFixed(1)}%`} />
+                    <DetailRow
+                      label="AWT Increase"
+                      value={`${mcResult.stressTest.degradationPercent > 0 ? '+' : ''}${mcResult.stressTest.degradationPercent.toFixed(1)}%`}
+                      valueClass={
+                        Math.abs(mcResult.stressTest.degradationPercent) <= 20
+                          ? 'text-emerald-500'
+                          : mcResult.stressTest.degradationPercent <= 40
+                            ? 'text-amber-400'
+                            : 'text-red-400'
+                      }
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : null}
+        </>
+      )}
     </Card>
   );
 }
@@ -545,12 +816,14 @@ function MetricCell({
   value,
   unit,
   modified,
+  mcRange,
 }: {
   icon: React.ReactNode;
   label: string;
   value: string;
   unit?: string;
   modified?: boolean;
+  mcRange?: string;
 }) {
   return (
     <div className="px-4 py-3.5 text-center">
@@ -562,6 +835,11 @@ function MetricCell({
         {value}
         {unit && <span className="text-xs text-muted-foreground ml-1 font-normal">{unit}</span>}
       </div>
+      {mcRange && (
+        <div className="text-[10px] text-muted-foreground font-mono tabular-nums mt-0.5">
+          {mcRange}
+        </div>
+      )}
     </div>
   );
 }
@@ -892,6 +1170,12 @@ export default function ElevatorCalculator() {
   // Destination dispatch toggle — applied before analysis
   const [destinationDispatch, setDestinationDispatch] = useState(false);
 
+  // Monte Carlo simulation state
+  const [monteCarloEnabled, setMonteCarloEnabled] = useState(false);
+  const [mcTrials, setMcTrials] = useState<string>("1000");
+  const [mcRunning, setMcRunning] = useState(false);
+  const [mcResults, setMcResults] = useState<Record<number, MonteCarloResult>>({});
+
   // Comparison mode: saved snapshots
   interface SavedSnapshot {
     id: number;
@@ -946,6 +1230,78 @@ export default function ElevatorCalculator() {
     const key = keys[zoneIndex];
     return key ? zoneFloorMap.get(key) || [] : [];
   }, [zoneFloorMap]);
+
+  // Helper: compute express distance for a zone from floor data
+  const computeExpressDistance = useCallback((zone: ZoneOutput, zoneFloors: FloorInput[]): number => {
+    // Find the lowest demand floor's elevation if available
+    const lowestFloor = zoneFloors.find(f => f.elevation !== undefined && f.elevation > 0);
+    if (lowestFloor?.elevation) return lowestFloor.elevation;
+    // Estimate from floor heights — floors below the zone are express
+    // Parse the zone's floorsServed to estimate which floor index it starts at
+    const match = zone.floorsServed.match(/(\d+)/);
+    const startFloorNum = match ? parseInt(match[1]) : 2;
+    const avgHeight = zoneFloors[0]?.floorToFloorHeight || DEFAULT_FLOOR_HEIGHT;
+    return Math.max(0, (startFloorNum - 1) * avgHeight);
+  }, [DEFAULT_FLOOR_HEIGHT]);
+
+  // Run Monte Carlo simulation for all zones
+  const runMonteCarlo = useCallback(async (analysisResult: AnalysisResult) => {
+    setMcRunning(true);
+    setMcResults({});
+    const results: Record<number, MonteCarloResult> = {};
+    const config = BUILDING_ARRIVAL_RATES[buildingType] || { rate: 0.12, pattern: 'uppeak' as const };
+    const density = densityOverride ? parseFloat(densityOverride) : undefined;
+
+    for (const zone of analysisResult.zones) {
+      const zoneFloors = getZoneFloors(zone.zoneIndex);
+      const demandFloors = zoneFloors.filter(f => !f.zone?.includes(','));
+      const floorHeights = (demandFloors.length > 0 ? demandFloors : zoneFloors).map(
+        f => f.floorToFloorHeight || DEFAULT_FLOOR_HEIGHT
+      );
+
+      // Use per-floor density and population logic matching the engine
+      const defaultDensity = density || zone.densitySqftPerPerson || 135;
+      const floorPops = (demandFloors.length > 0 ? demandFloors : zoneFloors).map(f => {
+        if (f.totalPopulation && f.totalPopulation > 0) return f.totalPopulation;
+        const d = f.densitySqftPerPerson || defaultDensity;
+        return Math.round(f.grossArea / d);
+      });
+
+      const ov = zoneOverrides[zone.zoneIndex] || {};
+
+      const params: MonteCarloParams = {
+        numElevators: zone.numElevators,
+        capacityLbs: zone.capacityLbs,
+        capacityPersons: zone.capacityPersons,
+        speedFpm: zone.speedFpm,
+        numTrials: parseInt(mcTrials) || 1000,
+        simulationDuration: 300,
+        floorHeights,
+        floorPopulations: floorPops,
+        expressDistanceFt: computeExpressDistance(zone, zoneFloors),
+        arrivalRate: config.rate,
+        doorHeightFt: ov.doorHeightFt || 8,
+        trafficPattern: config.pattern,
+      };
+
+      // Yield to UI between zones
+      await new Promise(resolve => setTimeout(resolve, 0));
+      const mcResult = runMonteCarloSimulation(params);
+
+      // Run stress test (1 elevator removed)
+      if (zone.numElevators > 1) {
+        const stressResult = runStressTest(params);
+        mcResult.stressTest = stressResult.stressTest;
+      }
+
+      results[zone.zoneIndex] = mcResult;
+      // Update progressively
+      setMcResults({ ...results });
+    }
+
+    setMcResults(results);
+    setMcRunning(false);
+  }, [buildingType, densityOverride, mcTrials, getZoneFloors, zoneOverrides, computeExpressDistance, DEFAULT_FLOOR_HEIGHT]);
 
   // Compute displayed result — apply overrides + criteria to base result.
   // Re-evaluates pass/fail for every zone so criteria changes take effect
@@ -1070,7 +1426,14 @@ export default function ElevatorCalculator() {
     const analysisResult = analyzeElevators(buildingType, validFloors, DEFAULT_FLOOR_HEIGHT, density, criteriaOverrides, destinationDispatch);
     setBaseResult(analysisResult);
     setZoneOverrides({});
-  }, [buildingType, floors, densityOverride, criteriaOverrides, destinationDispatch, toast]);
+    setMcResults({});
+
+    // Run Monte Carlo if enabled
+    if (monteCarloEnabled) {
+      // Defer to next tick so deterministic results render first
+      setTimeout(() => runMonteCarlo(analysisResult), 50);
+    }
+  }, [buildingType, floors, densityOverride, criteriaOverrides, destinationDispatch, toast, monteCarloEnabled, runMonteCarlo]);
 
   const handleOverrideChange = useCallback((zoneIndex: number, override: ZoneOverride) => {
     setZoneOverrides((prev) => ({ ...prev, [zoneIndex]: override }));
@@ -1312,6 +1675,47 @@ export default function ElevatorCalculator() {
                   />
                 </div>
 
+                {/* Monte Carlo Toggle */}
+                <div className="flex items-center justify-between px-1">
+                  <div className="flex items-center gap-1.5">
+                    <Label htmlFor="mc-toggle" className="text-xs text-muted-foreground cursor-pointer select-none">
+                      Monte Carlo Simulation
+                    </Label>
+                    <TooltipProvider delayDuration={200}>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Info className="h-3 w-3 text-muted-foreground/50" />
+                        </TooltipTrigger>
+                        <TooltipContent side="right" className="max-w-[240px] text-xs">
+                          Runs N stochastic simulations of the 5-minute peak period using Poisson arrivals and destination dispatch. Reports confidence intervals and statistical distributions.
+                        </TooltipContent>
+                      </Tooltip>
+                    </TooltipProvider>
+                  </div>
+                  <Switch
+                    id="mc-toggle"
+                    checked={monteCarloEnabled}
+                    onCheckedChange={setMonteCarloEnabled}
+                    data-testid="switch-monte-carlo"
+                  />
+                </div>
+                {monteCarloEnabled && (
+                  <div className="flex items-center gap-2 px-1">
+                    <Label className="text-[11px] text-muted-foreground">Trials</Label>
+                    <Select value={mcTrials} onValueChange={setMcTrials}>
+                      <SelectTrigger className="h-7 w-24 text-xs bg-background" data-testid="select-mc-trials">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="500">500</SelectItem>
+                        <SelectItem value="1000">1,000</SelectItem>
+                        <SelectItem value="2000">2,000</SelectItem>
+                        <SelectItem value="5000">5,000</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                )}
+
                 <Separator className="bg-border/30" />
 
                 {/* Upload Zone */}
@@ -1324,10 +1728,20 @@ export default function ElevatorCalculator() {
                 <Button
                   className="w-full h-10"
                   onClick={runAnalysis}
+                  disabled={mcRunning}
                   data-testid="button-analyze"
                 >
-                  <Calculator className="h-4 w-4 mr-2" />
-                  Run Analysis
+                  {mcRunning ? (
+                    <>
+                      <span className="inline-block h-3 w-3 rounded-full border-2 border-current border-t-transparent animate-spin mr-2" />
+                      Simulating…
+                    </>
+                  ) : (
+                    <>
+                      <Calculator className="h-4 w-4 mr-2" />
+                      Run Analysis
+                    </>
+                  )}
                 </Button>
               </div>
             </Card>
@@ -1466,6 +1880,8 @@ export default function ElevatorCalculator() {
                       !!zoneOverrides[zone.zoneIndex] &&
                       Object.values(zoneOverrides[zone.zoneIndex]).some((v) => v !== undefined)
                     }
+                    mcResult={mcResults[zone.zoneIndex]}
+                    mcRunning={mcRunning}
                   />
                 ))}
               </div>

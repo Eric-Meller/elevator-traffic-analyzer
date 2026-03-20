@@ -91,6 +91,27 @@ export interface ZoneOutput {
   downPeakAwtSec: number;           // average wait time during down-peak
   downPeakRttSec: number;           // round-trip time during down-peak
   downPeakMeetsCriteria: boolean;   // does it meet the same pass criteria during down-peak?
+  // Monte Carlo simulation results (optional — populated when MC is enabled)
+  monteCarloResult?: {
+    medianAwtSec: number;
+    p10AwtSec: number;
+    p90AwtSec: number;
+    meanAwtSec: number;
+    medianIntervalSec: number;
+    p90IntervalSec: number;
+    meanHcPercent: number;
+    p10HcPercent: number;
+    medianRttSec: number;
+    trialAwts: number[];
+    trialHcPercents: number[];
+    trialIntervals: number[];
+    timelineData: { timeSec: number; waitingPassengers: number; activeElevators: number; passengersServed: number; }[];
+    carUtilization: number[];
+    stressTest?: { elevatorsRemoved: number; medianAwtSec: number; p90AwtSec: number; meanHcPercent: number; degradationPercent: number; };
+    confidenceLevel: number;
+    numTrials: number;
+    totalPassengersSimulated: number;
+  };
 }
 
 // Per-zone user overrides for tuning
